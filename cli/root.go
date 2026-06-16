@@ -27,7 +27,7 @@ func NewApp() *kit.App {
 	id := gfg.Domain{}.Info().Identity
 	id.Version = Version
 
-	app := kit.New(id)
+	app := kit.New(id, kit.WithDefaults(gfg.Defaults))
 	(gfg.Domain{}).Register(app)
 	app.AddCommand(newVersionCmd())
 	return app
