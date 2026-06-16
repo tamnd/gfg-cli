@@ -1,60 +1,206 @@
-// Package gfg is the library behind the gfg command line:
-// the HTTP client, request shaping, and the typed data models for gfg.
+// Package gfg is the library behind the gfg command line: the HTTP client,
+// request shaping, and the typed data models for GeeksforGeeks.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// GFG serves article pages server-side with Open Graph meta tags and
+// schema.org JSON-LD embedded in the HTML. The client GETs those pages and
+// extracts structured fields without a headless browser. Category pages carry
+// navigation links the client filters to article-path stubs. The search page
+// is pure client-side JavaScript; the search op exits 5 with a message that
+// explains the limitation.
 package gfg
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/PuerkitoBio/goquery"
 )
 
-// DefaultUserAgent identifies the client to gfg. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "gfg/dev (+https://github.com/tamnd/gfg-cli)"
+// Host is the site this client talks to.
+const Host = "www.geeksforgeeks.org"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at gfg.com; change it once you
-// know the real endpoints you want to read.
-const Host = "gfg.com"
-
-// BaseURL is the root every request is built from.
+// BaseURL is the root every article and category URL is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to gfg over HTTP.
+// DefaultUserAgent mimics a real desktop browser. GFG's CloudFront CDN serves
+// pages to browser User-Agents; a genuine-looking UA keeps responses full.
+const DefaultUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+	"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
+const (
+	DefaultRate    = 500 * time.Millisecond
+	DefaultRetries = 3
+	DefaultTimeout = 30 * time.Second
+)
+
+// Sentinel errors.
+var (
+	ErrNotFound    = errors.New("not found")
+	ErrBlocked     = errors.New("blocked by WAF")
+	ErrRateLimited = errors.New("rate limited")
+)
+
+// Article is the full record for one GFG article.
+type Article struct {
+	Slug        string `json:"slug" kit:"id"`
+	Title       string `json:"title,omitempty"`
+	Description string `json:"description,omitempty" table:",truncate"`
+	Section     string `json:"section,omitempty"`
+	Tags        string `json:"tags,omitempty" table:",truncate"`
+	Author      string `json:"author,omitempty"`
+	Published   string `json:"published,omitempty"`
+	Modified    string `json:"modified,omitempty"`
+	Image       string `json:"image,omitempty" table:",truncate"`
+	URL         string `json:"url"`
+}
+
+// ArticleRef is a lightweight stub emitted by related and category commands.
+type ArticleRef struct {
+	Slug  string `json:"slug" kit:"id"`
+	Title string `json:"title,omitempty"`
+	URL   string `json:"url"`
+}
+
+// Suggestion is one autocomplete result.
+type Suggestion struct {
+	Query string `json:"query"`
+	Term  string `json:"term" kit:"id"`
+	URL   string `json:"url,omitempty"`
+}
+
+// Topic is a well-known GFG topic from the site navigation.
+type Topic struct {
+	Slug string `json:"slug" kit:"id"`
+	Name string `json:"name"`
+	URL  string `json:"url"`
+}
+
+// Client talks to GeeksforGeeks over HTTP.
 type Client struct {
 	HTTP      *http.Client
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+	Rate      time.Duration
+	Retries   int
 
+	mu   sync.Mutex
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: DefaultTimeout},
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      DefaultRate,
+		Retries:   DefaultRetries,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// GetArticle fetches one article by slug (or URL) and returns an Article.
+func (c *Client) GetArticle(ctx context.Context, slug string) (*Article, error) {
+	slug = normalizeSlug(slug)
+	if slug == "" {
+		return nil, ErrNotFound
+	}
+	u := c.BaseURL + "/" + slug + "/"
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	return parseArticle(body, slug), nil
+}
+
+// RelatedArticles fetches one article page and returns the related-article links
+// found in the sidebar and inline link grid.
+func (c *Client) RelatedArticles(ctx context.Context, slug string, limit int) ([]*ArticleRef, error) {
+	slug = normalizeSlug(slug)
+	if slug == "" {
+		return nil, ErrNotFound
+	}
+	u := c.BaseURL + "/" + slug + "/"
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	return parseArticleRefs(body, limit), nil
+}
+
+// CategoryArticles fetches a GFG category page and extracts article links.
+func (c *Client) CategoryArticles(ctx context.Context, slug string, limit int) ([]*ArticleRef, error) {
+	slug = normalizeSlug(slug)
+	if slug == "" {
+		return nil, ErrNotFound
+	}
+	// Category pages live at /category/<slug>/ or just /<slug>/
+	u := c.BaseURL + "/category/" + slug + "/"
+	body, err := c.get(ctx, u)
+	if err != nil {
+		// Try without /category/ prefix.
+		u = c.BaseURL + "/" + slug + "/"
+		body, err = c.get(ctx, u)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return parseArticleRefs(body, limit), nil
+}
+
+// Suggest calls GFG's autocomplete endpoint. This endpoint is blocked by
+// CloudFront from datacenter IPs; the function returns ErrBlocked when the
+// WAF fires.
+func (c *Client) Suggest(ctx context.Context, prefix string, limit int) ([]*Suggestion, error) {
+	u := c.BaseURL + "/gfg-api/v1/suggestions/?q=" + url.QueryEscape(prefix)
+	body, err := c.get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	return parseSuggestions(body, prefix, limit), nil
+}
+
+// Topics returns the well-known GFG topic list with no network call.
+func Topics() []*Topic {
+	type entry struct{ slug, name string }
+	entries := []entry{
+		{"dsa", "Data Structures and Algorithms"},
+		{"algorithms", "Algorithms"},
+		{"python", "Python"},
+		{"cpp", "C++"},
+		{"c", "C"},
+		{"java", "Java"},
+		{"javascript", "JavaScript"},
+		{"data-science", "Data Science"},
+		{"machine-learning", "Machine Learning"},
+		{"web-dev", "Web Development"},
+		{"system-design", "System Design"},
+		{"dbms", "DBMS"},
+		{"os", "Operating Systems"},
+		{"cn", "Computer Networks"},
+	}
+	out := make([]*Topic, len(entries))
+	for i, e := range entries {
+		out[i] = &Topic{
+			Slug: e.slug,
+			Name: e.name,
+			URL:  BaseURL + "/category/" + e.slug + "/",
+		}
+	}
+	return out
+}
+
+// get fetches a URL with pacing and retries.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,7 +210,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,16 +219,18 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) ([]byte, bool, error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json,*/*")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
@@ -90,23 +238,44 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		// check for WAF block via content type
+		ct := resp.Header.Get("Content-Type")
+		b, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+		if err != nil {
+			return nil, true, err
+		}
+		// GFG's API paths return 200 with CloudFront error HTML when blocked.
+		if strings.Contains(ct, "text/html") && isWAFBlock(b) {
+			return nil, false, ErrBlocked
+		}
+		return b, false, nil
+	case resp.StatusCode == http.StatusForbidden:
+		return nil, false, ErrBlocked
+	case resp.StatusCode == http.StatusNotFound:
+		return nil, false, ErrNotFound
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return nil, true, ErrRateLimited
+	case resp.StatusCode >= 500:
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
+	default:
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
-
-	b, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, true, err
-	}
-	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// isWAFBlock detects CloudFront WAF error pages embedded in a 200 response.
+func isWAFBlock(b []byte) bool {
+	return bytes.Contains(b, []byte("Request blocked")) ||
+		bytes.Contains(b, []byte("ERROR: The request could not be satisfied")) ||
+		bytes.Contains(b, []byte("Generated by cloudfront"))
+}
+
 func (c *Client) pace() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.Rate <= 0 {
+		c.last = time.Now()
 		return
 	}
 	if wait := c.Rate - time.Since(c.last); wait > 0 {
@@ -123,78 +292,250 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on gfg.com. It is a stand-in for the typed records you
-// will model from the real gfg endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `gfg cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
+// --- parsers ---
 
 var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
+	metaRE  = regexp.MustCompile(`<meta\s+[^>]*property="([^"]+)"\s+content="([^"]*)"`)
+	metaRE2 = regexp.MustCompile(`<meta\s+[^>]*content="([^"]*)"\s+[^>]*property="([^"]+)"`)
 )
 
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
+// parseArticle extracts an Article from a GFG page body.
+func parseArticle(body []byte, slug string) *Article {
+	art := &Article{
+		Slug: slug,
+		URL:  BaseURL + "/" + slug + "/",
+	}
+
+	// Extract Open Graph and article meta tags.
+	metas := extractMetas(body)
+	art.Title = metas["og:title"]
+	art.Description = metas["og:description"]
+	art.Section = metas["article:section"]
+	art.Published = metas["article:published_time"]
+	art.Modified = metas["article:modified_time"]
+	art.Image = metas["og:image"]
+	if u := metas["og:url"]; u != "" {
+		art.URL = u
+		// Update slug from canonical URL.
+		if p := pathFromURL(u); p != "" {
+			art.Slug = p
+		}
+	}
+
+	// Collect all article:tag values.
+	art.Tags = strings.Join(metaValues(body, "article:tag"), ", ")
+
+	// JSON-LD fills author and supplements other fields.
+	fillFromJSONLD(body, art)
+
+	return art
+}
+
+// extractMetas pulls property → content pairs from meta tags.
+func extractMetas(body []byte) map[string]string {
+	out := map[string]string{}
+	for _, m := range metaRE.FindAllSubmatch(body, -1) {
+		k := string(m[1])
+		if _, exists := out[k]; !exists {
+			out[k] = string(m[2])
+		}
+	}
+	for _, m := range metaRE2.FindAllSubmatch(body, -1) {
+		k := string(m[2])
+		if _, exists := out[k]; !exists {
+			out[k] = string(m[1])
 		}
 	}
 	return out
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// metaValues returns all content values for a given property (handles repeated tags).
+func metaValues(body []byte, property string) []string {
+	var out []string
+	seen := map[string]bool{}
+	// Match both attribute orderings.
+	patterns := []*regexp.Regexp{
+		regexp.MustCompile(`<meta\s+[^>]*property="` + regexp.QuoteMeta(property) + `"\s+content="([^"]*)"`),
+		regexp.MustCompile(`<meta\s+[^>]*content="([^"]*)"\s+[^>]*property="` + regexp.QuoteMeta(property) + `"`),
 	}
-	return s
+	for _, re := range patterns {
+		for _, m := range re.FindAllSubmatch(body, -1) {
+			v := string(m[1])
+			if v != "" && !seen[v] {
+				seen[v] = true
+				out = append(out, v)
+			}
+		}
+	}
+	return out
+}
+
+// articleJSONLD is the subset of JSON-LD fields we read.
+type articleJSONLD struct {
+	Type          string `json:"@type"`
+	Headline      string `json:"headline"`
+	DatePublished string `json:"datePublished"`
+	DateModified  string `json:"dateModified"`
+	Author        struct {
+		Name string `json:"name"`
+	} `json:"author"`
+	About []struct {
+		Name string `json:"name"`
+	} `json:"about"`
+}
+
+// fillFromJSONLD reads the first Article-type JSON-LD block and supplements art.
+func fillFromJSONLD(body []byte, art *Article) {
+	re := regexp.MustCompile(`<script\s+type="application/ld\+json"[^>]*>([\s\S]*?)</script>`)
+	for _, m := range re.FindAllSubmatch(body, -1) {
+		var jld articleJSONLD
+		if err := json.Unmarshal(m[1], &jld); err != nil {
+			continue
+		}
+		if jld.Type != "Article" {
+			continue
+		}
+		if art.Title == "" && jld.Headline != "" {
+			art.Title = jld.Headline
+		}
+		if art.Author == "" && jld.Author.Name != "" {
+			art.Author = jld.Author.Name
+		}
+		if art.Published == "" && jld.DatePublished != "" {
+			art.Published = jld.DatePublished
+		}
+		if art.Modified == "" && jld.DateModified != "" {
+			art.Modified = jld.DateModified
+		}
+		// Supplement tags from about list.
+		if len(jld.About) > 0 && art.Tags == "" {
+			names := make([]string, 0, len(jld.About))
+			for _, a := range jld.About {
+				if a.Name != "" {
+					names = append(names, a.Name)
+				}
+			}
+			art.Tags = strings.Join(names, ", ")
+		}
+		return
+	}
+}
+
+// parseArticleRefs extracts ArticleRef stubs from a GFG page body.
+func parseArticleRefs(body []byte, limit int) []*ArticleRef {
+	doc, err := goquery.NewDocumentFromReader(bytes.NewReader(body))
+	if err != nil {
+		return nil
+	}
+
+	var out []*ArticleRef
+	seen := map[string]bool{}
+
+	doc.Find("a[href]").Each(func(_ int, s *goquery.Selection) {
+		if limit > 0 && len(out) >= limit {
+			return
+		}
+		href, _ := s.Attr("href")
+		slug := articleSlugFromHref(href)
+		if slug == "" || seen[slug] {
+			return
+		}
+		seen[slug] = true
+		title := strings.TrimSpace(s.Text())
+		out = append(out, &ArticleRef{
+			Slug:  slug,
+			Title: title,
+			URL:   BaseURL + "/" + slug + "/",
+		})
+	})
+	return out
+}
+
+// articleSlugFromHref returns the article slug from an href, or empty if the
+// link does not look like a GFG article path.
+func articleSlugFromHref(href string) string {
+	u, err := url.Parse(href)
+	if err != nil {
+		return ""
+	}
+	// Must be same host or relative path.
+	if u.Host != "" && u.Host != Host {
+		return ""
+	}
+	path := strings.Trim(u.Path, "/")
+	if path == "" {
+		return ""
+	}
+	// Must look like an article path: one or two path segments, lowercase,
+	// alphanumeric and hyphens, no file extensions.
+	parts := strings.Split(path, "/")
+	if len(parts) < 1 || len(parts) > 2 {
+		return ""
+	}
+	// Exclude known non-article paths.
+	skip := map[string]bool{
+		"category": true, "tag": true, "login": true, "register": true,
+		"courses": true, "about": true, "legal": true, "advertise-with-us": true,
+		"campus-training-program": true, "search": true, "videos": true,
+		"explore": true, "nation-skill-up": true, "gfg-corporate-solution": true,
+		"problem-of-the-day": true, "premium": true,
+	}
+	if skip[parts[0]] {
+		return ""
+	}
+	// Each part must be slug-like (letters, digits, hyphens).
+	slugRE := regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
+	for _, p := range parts {
+		if !slugRE.MatchString(p) {
+			return ""
+		}
+	}
+	return path
+}
+
+// suggestResponse is the JSON shape of GFG's autocomplete API.
+type suggestResponse struct {
+	Data []struct {
+		Title string `json:"title"`
+		URL   string `json:"url"`
+	} `json:"data"`
+}
+
+// parseSuggestions decodes GFG autocomplete JSON.
+func parseSuggestions(body []byte, query string, limit int) []*Suggestion {
+	var resp suggestResponse
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil
+	}
+	var out []*Suggestion
+	for _, d := range resp.Data {
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+		out = append(out, &Suggestion{
+			Query: query,
+			Term:  d.Title,
+			URL:   d.URL,
+		})
+	}
+	return out
+}
+
+// normalizeSlug converts a URL or slug to the canonical path component
+// (section/slug or bare slug), without leading/trailing slashes.
+func normalizeSlug(input string) string {
+	input = strings.TrimSpace(input)
+	if u, err := url.Parse(input); err == nil && u.Host != "" {
+		return strings.Trim(u.Path, "/")
+	}
+	return strings.Trim(input, "/")
+}
+
+// pathFromURL extracts the path from a full URL.
+func pathFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return strings.Trim(u.Path, "/")
 }
