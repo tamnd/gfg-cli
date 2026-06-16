@@ -1,0 +1,10 @@
+title       = "gfg"
+baseURL     = "https://gfg-cli.tamnd.com/"
+description = "Browse GeeksForGeeks tutorials and articles"
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/gfg-cli"
